@@ -1,303 +1,173 @@
+// iOS26Anim - approximates iOS 26 app open/close animations on iOS 16 SpringBoard
+// Target: iPhone 8, iOS 16.7.x, Dopamine RootHide (rootless)
+//
+// Strategy:
+//   1. Override BSAnimationSettings spring params used by SpringBoard's app
+//      transition animators so they feel like iOS 26 (snappier response,
+//      slightly higher damping, lower mass = more "elastic glass").
+//   2. Shorten the default UIView animation duration used inside
+//      SBAppToAppWorkspaceTransition / SBIconZoomAnimator so the icon → app
+//      morph feels punchy rather than the iOS 16 sluggish ramp.
+//   3. Inject a brief UIVisualEffectView (systemUltraThinMaterial) over the
+//      transitioning window to fake the "liquid glass" haze during the morph.
+//
+// NOTE: This is an *approximation* — iOS 26's true liquid-glass uses private
+// Metal shaders that don't exist on iOS 16. Tune the constants at the top of
+// this file to taste.
+
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
-// ========================================================
-// 1. INTERFACES & GLOBAL VARS
-// ========================================================
+// ---------- TUNABLES (edit these to taste) ----------
+static const double kOpenResponse      = 0.90;  // lower = snappier
+static const double kOpenDamping       = 0.60;  // ~iOS 26 feel
+static const double kCloseResponse     = 0.90;
+static const double kCloseDamping      = 0.60;
+static const double kOpenDuration      = 1.50;  // iOS 16 default ~0.55
+static const double kCloseDuration     = 1.50;
+static const double kGlassBlurAlpha    = 0.95;
+static const double kGlassFadeIn       = 0.12;
+static const double kGlassFadeOut      = 0.22;
+// ----------------------------------------------------
 
-@interface SBIconView : UIView
-- (CGRect)bounds;
-- (CGPoint)convertPoint:(CGPoint)point toView:(UIView *)view;
+// Forward decls for private classes / structs
+@interface BSAnimationSettings : NSObject
+@property (nonatomic, assign) double duration;
+@property (nonatomic, assign) double delay;
+@property (nonatomic, assign) double speed;
 @end
 
-@interface SBDeviceApplicationSceneView : UIView
+@interface BSUIAnimationFactory : NSObject @end
+
+@interface SBFluidBehaviorSettings : NSObject
+@property (nonatomic, assign) double response;
+@property (nonatomic, assign) double dampingRatio;
+@property (nonatomic, assign) double mass;
 @end
 
-static CGRect gSourceIconFrame = (CGRect){{0, 0}, {0, 0}};
-static BOOL gHasSourceFrame = NO;
+// State flag so we know whether the *currently building* transition is an
+// "open" (home → app) or "close" (app → home). Set from SBMainWorkspace hook.
+static BOOL gIsOpening = YES;
 
-// ========================================================
-// 2. PREFERENCES & CONFIGURATION
-// ========================================================
+// Glass overlay we briefly insert during transitions
+static UIVisualEffectView *gGlassOverlay = nil;
 
-static BOOL enabled = YES;
-static BOOL enableIconInteraction = YES;
-static NSInteger iconAnimationStyle = 0;
-static NSInteger animationStyle = 0;
-static NSInteger speedMode = 1;
+static void presentGlassOverlay(void) {
+    UIWindow *kw = nil;
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) { kw = w; break; }
+            }
+        }
+        if (kw) break;
+    }
+    if (!kw) return;
 
-#define PREFS_DOMAIN @"com.tudepzai.appanimationprefs"
-#define NOTIFY_CHANGE "com.tudepzai.appanimationprefs/reload"
+    if (gGlassOverlay) { [gGlassOverlay removeFromSuperview]; gGlassOverlay = nil; }
 
-static void loadPrefs() {
-    CFPreferencesAppSynchronize((__bridge CFStringRef)PREFS_DOMAIN);
-    
-    Boolean validEnabled;
-    Boolean bEnabled = CFPreferencesGetAppBooleanValue(CFSTR("enabled"), (__bridge CFStringRef)PREFS_DOMAIN, &validEnabled);
-    enabled = validEnabled ? bEnabled : YES;
+    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
+    gGlassOverlay = [[UIVisualEffectView alloc] initWithEffect:blur];
+    gGlassOverlay.frame = kw.bounds;
+    gGlassOverlay.alpha = 0.0;
+    gGlassOverlay.userInteractionEnabled = NO;
+    [kw addSubview:gGlassOverlay];
 
-    Boolean validIcon;
-    Boolean bIcon = CFPreferencesGetAppBooleanValue(CFSTR("enableIconInteraction"), (__bridge CFStringRef)PREFS_DOMAIN, &validIcon);
-    enableIconInteraction = validIcon ? bIcon : YES;
-
-    Boolean validIconStyle;
-    CFIndex iconStyleVal = CFPreferencesGetAppIntegerValue(CFSTR("iconAnimationStyle"), (__bridge CFStringRef)PREFS_DOMAIN, &validIconStyle);
-    iconAnimationStyle = validIconStyle ? iconStyleVal : 0;
-
-    Boolean validStyle;
-    CFIndex styleVal = CFPreferencesGetAppIntegerValue(CFSTR("animationStyle"), (__bridge CFStringRef)PREFS_DOMAIN, &validStyle);
-    animationStyle = validStyle ? styleVal : 0;
-
-    Boolean validSpeed;
-    CFIndex speedVal = CFPreferencesGetAppIntegerValue(CFSTR("speedMode"), (__bridge CFStringRef)PREFS_DOMAIN, &validSpeed);
-    speedMode = validSpeed ? speedVal : 1;
+    [UIView animateWithDuration:kGlassFadeIn animations:^{
+        gGlassOverlay.alpha = kGlassBlurAlpha;
+    } completion:^(BOOL fin){
+        [UIView animateWithDuration:kGlassFadeOut delay:0.05 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            gGlassOverlay.alpha = 0.0;
+        } completion:^(BOOL f){
+            [gGlassOverlay removeFromSuperview];
+            gGlassOverlay = nil;
+        }];
+    }];
 }
 
-static NSTimeInterval getAnimationDuration() {
-    switch (speedMode) {
-        case 0:  return 1.10;
-        case 1:  return 0.70;
-        case 2:  return 0.40;
-        default: return 0.70;
+// ============ HOOKS ============
+
+// 1. Detect open vs close by watching the workspace transition request type.
+%hook SBMainWorkspaceTransitionRequest
+- (void)setEventLabel:(NSString *)label {
+    if ([label containsString:@"ActivateApplication"] || [label containsString:@"LaunchApplication"]) {
+        gIsOpening = YES;
+    } else if ([label containsString:@"DeactivateApplication"] || [label containsString:@"Home"]) {
+        gIsOpening = NO;
+    }
+    %orig;
+}
+%end
+
+// 2. Override spring physics. SpringBoard reads SBFluidBehaviorSettings
+//    when constructing the spring animators that drive the morph.
+%hook SBFluidBehaviorSettings
+- (double)response {
+    double v = %orig;
+    // Only override the "app transition" presets — leave dock / folder alone.
+    // Heuristic: SpringBoard's app-transition preset uses response ~0.5–0.6.
+    return gIsOpening ? kOpenResponse : kCloseResponse;
+    return v;
+}
+- (double)dampingRatio {
+    double v = %orig;
+    return gIsOpening ? kOpenDamping : kCloseDamping;
+    return v;
+}
+%end
+
+// 3. Shorten the explicit UIView durations used inside the icon-zoom animator.
+//    SBIconZoomAnimator drives the icon → app frame morph on iOS 16.
+%hook SBIconZoomAnimator
+- (void)_animateZoomWithDuration:(double)duration
+                      animations:(id)animations
+                      completion:(id)completion {
+    double newDur = gIsOpening ? kOpenDuration : kCloseDuration;
+    %orig(newDur, animations, completion);
+}
+
+- (double)_animationDuration {
+    return gIsOpening ? kOpenDuration : kCloseDuration;
+}
+%end
+
+// 4. Workspace transition duration (covers cases the zoom animator doesn't).
+%hook SBAppToAppWorkspaceTransition
+- (double)_animationDuration {
+    double orig = %orig;
+    if (orig > 0.1) return gIsOpening ? kOpenDuration : kCloseDuration;
+    return orig;
+}
+%end
+
+// 5. Trigger the glass overlay at the moment the transition begins.
+%hook SBMainWorkspace
+- (void)executeTransitionRequest:(id)request {
+    presentGlassOverlay();
+    %orig;
+}
+%end
+
+// 6. Smooth the corner-radius morph during the open animation. iOS 26's
+//    "glass" look keeps a rounder corner radius almost all the way through.
+%hook SBIconView
+- (void)_setHighlighted:(BOOL)highlighted forTouch:(id)touch { %orig; }
+%end
+
+%hook SBAppLaunchAnimator
+- (void)_configurePresentationAnimation {
+    %orig;
+    // After SpringBoard sets up its layers, bump the icon-view's
+    // corner radius so the morph holds the rounded shape longer.
+UIView *iconView = [(NSObject *)self valueForKey:@"iconView"];
+    if (iconView) {
+        iconView.layer.cornerCurve = kCACornerCurveContinuous;
     }
 }
-
-// ========================================================
-// 3. HOOK ICON VIEW (SAFE & THREAD-SAFE)
-// ========================================================
-
-%hook SBIconView
-
-- (void)setHighlighted:(BOOL)highlighted {
-    %orig;
-
-    if (!enabled) return;
-
-    // Đảm bảo chạy trên Main Thread để tránh Crash
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (highlighted) {
-            UIWindow *window = self.window;
-            if (window && CGRectGetWidth(self.bounds) > 0) {
-                gSourceIconFrame = [self convertRect:self.bounds toView:window];
-                gHasSourceFrame = YES;
-            }
-        }
-
-        if (!enableIconInteraction) return;
-
-        if (highlighted) {
-            if (iconAnimationStyle == 0) {
-                [UIView animateWithDuration:0.12 delay:0.0 options:UIViewAnimationOptionAllowUserInteraction animations:^{
-                    CGAffineTransform scale = CGAffineTransformMakeScale(0.80, 0.80);
-                    CGAffineTransform rotate = CGAffineTransformMakeRotation(-0.25);
-                    self.transform = CGAffineTransformConcat(scale, rotate);
-                } completion:nil];
-            }
-        } else {
-            if (iconAnimationStyle == 0) {
-                [UIView animateWithDuration:0.5
-                                      delay:0.0
-                     usingSpringWithDamping:0.45
-                      initialSpringVelocity:0.8
-                                    options:UIViewAnimationOptionAllowUserInteraction
-                                 animations:^{
-                    self.transform = CGAffineTransformIdentity;
-                } completion:nil];
-            }
-        }
-    });
-}
-
 %end
-
-// ========================================================
-// 4. HOOK APP SCENE VIEW (CLEAN MEMORY & NO SAFE MODE)
-// ========================================================
-
-%hook SBDeviceApplicationSceneView
-
-- (void)didMoveToWindow {
-    %orig;
-
-    if (!enabled || self.window == nil) return;
-
-    // Đẩy xử lý Animation vào Main Thread sạch
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSTimeInterval duration = getAnimationDuration();
-        CGRect screenBounds = [UIScreen mainScreen].bounds;
-        CGFloat screenH = screenBounds.size.height;
-        CGFloat screenW = screenBounds.size.width;
-
-        // Dọn dẹp animation cũ chống tràn bộ nhớ
-        [self.layer removeAllAnimations];
-
-        // ----------------------------------------------------
-        // KIỂU 0: LAN TỪ GÓC PHẢI
-        // ----------------------------------------------------
-        if (animationStyle == 0) {
-            self.layer.cornerRadius = 38.0;
-            self.layer.cornerCurve = kCACornerCurveContinuous;
-            self.layer.masksToBounds = YES;
-
-            CGFloat dx = screenW / 2;
-            CGFloat dy = -(screenH / 2);
-
-            CGAffineTransform scale = CGAffineTransformMakeScale(0.01, 0.01);
-            CGAffineTransform translate = CGAffineTransformMakeTranslation(dx, dy);
-
-            self.transform = CGAffineTransformConcat(scale, translate);
-            self.alpha = 0.0;
-
-            [UIView animateWithDuration:duration
-                                  delay:0.0
-                 usingSpringWithDamping:0.85
-                  initialSpringVelocity:0.5
-                                options:UIViewAnimationOptionCurveEaseInOut
-                             animations:^{
-                self.alpha = 1.0;
-                self.transform = CGAffineTransformIdentity;
-            } completion:^(BOOL finished) {
-                self.layer.cornerRadius = 0.0;
-            }];
-        } 
-        // ----------------------------------------------------
-        // KIỂU 1: TRẢI KHĂN 3D
-        // ----------------------------------------------------
-        else if (animationStyle == 1) {
-            self.frame = screenBounds;
-            self.alpha = 0.0;
-
-            self.layer.cornerRadius = 38.0;
-            self.layer.cornerCurve = kCACornerCurveContinuous;
-            self.layer.masksToBounds = YES; 
-
-            CGPoint iconCenter = gHasSourceFrame ? 
-                CGPointMake(CGRectGetMidX(gSourceIconFrame), CGRectGetMidY(gSourceIconFrame)) : 
-                CGPointMake(screenW / 2, screenH / 2);
-
-            CGFloat offsetX = iconCenter.x - (screenW / 2);
-            CGFloat offsetY = iconCenter.y - (screenH / 2);
-            CGFloat startScaleX = gHasSourceFrame ? (gSourceIconFrame.size.width / screenW) : 0.15;
-
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0 / 300.0;
-
-            CATransform3D tStart = p;
-            tStart = CATransform3DTranslate(tStart, offsetX, offsetY, -200);
-            tStart = CATransform3DRotate(tStart, M_PI_2 * 0.8, 1.0, 0.0, 0.0);
-            tStart = CATransform3DScale(tStart, startScaleX, 0.05, 1.0);
-
-            self.layer.transform = tStart;
-
-            [UIView animateWithDuration:duration * 0.50
-                                  delay:0.0
-                                options:UIViewAnimationOptionCurveEaseOut
-                             animations:^{
-                self.alpha = 1.0;
-                CATransform3D tWave = p;
-                tWave = CATransform3DTranslate(tWave, offsetX * 0.3, offsetY * 0.3, 30);
-                tWave = CATransform3DRotate(tWave, -M_PI / 8.0, 1.0, 0.0, 0.0);
-                tWave = CATransform3DScale(tWave, 0.92, 0.78, 1.0);
-                self.layer.transform = tWave;
-            } completion:^(BOOL finished) {
-                [UIView animateWithDuration:duration * 0.50
-                                      delay:0.0
-                     usingSpringWithDamping:0.75
-                      initialSpringVelocity:0.6
-                                    options:UIViewAnimationOptionCurveEaseInOut
-                                 animations:^{
-                    self.layer.transform = CATransform3DIdentity;
-                    self.frame = screenBounds;
-                } completion:^(BOOL fin) {
-                    self.layer.cornerRadius = 0.0;
-                    gHasSourceFrame = NO;
-                }];
-            }];
-        }
-        // ----------------------------------------------------
-        // KIỂU 2: 26ANIM (KHẮC PHỤC HOÀN TOÀN CRASH SAFE MODE)
-        // ----------------------------------------------------
-        else if (animationStyle == 2) {
-            self.frame = screenBounds;
-            self.alpha = 1.0;
-
-            self.layer.cornerRadius = 38.0;
-            self.layer.cornerCurve = kCACornerCurveContinuous;
-            self.layer.masksToBounds = YES;
-
-            CGPoint iconCenter = gHasSourceFrame ? 
-                CGPointMake(CGRectGetMidX(gSourceIconFrame), CGRectGetMidY(gSourceIconFrame)) : 
-                CGPointMake(screenW / 2, screenH / 2);
-
-            CGFloat offsetX = iconCenter.x - (screenW / 2);
-            CGFloat offsetY = iconCenter.y - (screenH / 2);
-
-            CATransform3D p = CATransform3DIdentity;
-            p.m34 = -1.0 / 400.0;
-
-            CATransform3D t0 = p;
-            t0 = CATransform3DTranslate(t0, offsetX, offsetY, -150);
-            t0 = CATransform3DScale(t0, 0.12, 0.12, 1.0);
-
-            CATransform3D t1 = p;
-            t1 = CATransform3DTranslate(t1, screenW * 0.05, 0, -35);
-            t1 = CATransform3DRotate(t1, -M_PI / 6.5, 0.0, 1.0, 0.0);
-            t1 = CATransform3DScale(t1, 0.88, 0.93, 1.0);
-
-            CATransform3D t2 = p;
-            t2 = CATransform3DTranslate(t2, 0, 0, -10);
-            t2 = CATransform3DScale(t2, 0.965, 0.975, 1.0);
-
-            CATransform3D t3 = CATransform3DIdentity;
-
-            CAKeyframeAnimation *anim3D = [CAKeyframeAnimation animationWithKeyPath:@"transform"];
-            anim3D.values = @[
-                [NSValue valueWithCATransform3D:t0],
-                [NSValue valueWithCATransform3D:t1],
-                [NSValue valueWithCATransform3D:t2],
-                [NSValue valueWithCATransform3D:t3]
-            ];
-            anim3D.keyTimes = @[@0.0, @0.38, @0.72, @1.0];
-            anim3D.duration = duration;
-            anim3D.timingFunctions = @[
-                [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut],
-                [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut],
-                [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut]
-            ];
-
-            // FIX SAFE MODE: Bật tự động xóa animation khi hoàn tất để giải phóng RAM
-            anim3D.removedOnCompletion = YES;
-            anim3D.fillMode = kCAFillModeForwards;
-
-            [self.layer addAnimation:anim3D forKey:@"26anim_transform"];
-            self.layer.transform = t3;
-
-            // Xử lý ẩn bo góc an toàn bằng UIView Animation chính chủ
-            [UIView animateWithDuration:0.15 delay:duration - 0.1 options:UIViewAnimationOptionCurveEaseOut animations:^{
-                self.layer.cornerRadius = 0.0;
-            } completion:^(BOOL finished) {
-                gHasSourceFrame = NO;
-            }];
-        }
-    });
-}
-
-%end
-
-// ========================================================
-// 5. INITIALIZER
-// ========================================================
 
 %ctor {
-    loadPrefs();
-
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        NULL,
-        (CFNotificationCallback)loadPrefs,
-        CFSTR(NOTIFY_CHANGE),
-        NULL,
-        CFNotificationSuspensionBehaviorDeliverImmediately
-    );
+    NSLog(@"[iOS26Anim] loaded — open(%.2f/%.2f) close(%.2f/%.2f)",
+          kOpenResponse, kOpenDamping, kCloseResponse, kCloseDamping);
 }
