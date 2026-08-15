@@ -1,0 +1,30 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Cài Theos
+        uses: theos/actions/install@master
+        with:
+          theos-version: 'master'
+
+      - name: Build package (.deb)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom26-deb
+          path: packages/*.deb
