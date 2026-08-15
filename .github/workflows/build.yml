@@ -13,13 +13,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Cài Theos
-        uses: theos/actions/install@master
-        with:
-          theos-version: 'master'
+        uses: Randomblock1/theos-action@v1
 
       - name: Build package (.deb)
-        env:
-          THEOS: ${{ github.workspace }}/theos
         run: |
           make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
