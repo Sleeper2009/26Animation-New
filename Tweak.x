@@ -1,173 +1,265 @@
-// iOS26Anim - approximates iOS 26 app open/close animations on iOS 16 SpringBoard
-// Target: iPhone 8, iOS 16.7.x, Dopamine RootHide (rootless)
-//
-// Strategy:
-//   1. Override BSAnimationSettings spring params used by SpringBoard's app
-//      transition animators so they feel like iOS 26 (snappier response,
-//      slightly higher damping, lower mass = more "elastic glass").
-//   2. Shorten the default UIView animation duration used inside
-//      SBAppToAppWorkspaceTransition / SBIconZoomAnimator so the icon → app
-//      morph feels punchy rather than the iOS 16 sluggish ramp.
-//   3. Inject a brief UIVisualEffectView (systemUltraThinMaterial) over the
-//      transitioning window to fake the "liquid glass" haze during the morph.
-//
-// NOTE: This is an *approximation* — iOS 26's true liquid-glass uses private
-// Metal shaders that don't exist on iOS 16. Tune the constants at the top of
-// this file to taste.
-
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
-// ---------- TUNABLES (edit these to taste) ----------
-static const double kOpenResponse      = 0.90;  // lower = snappier
-static const double kOpenDamping       = 0.60;  // ~iOS 26 feel
-static const double kCloseResponse     = 0.90;
-static const double kCloseDamping      = 0.60;
-static const double kOpenDuration      = 1.50;  // iOS 16 default ~0.55
-static const double kCloseDuration     = 1.50;
-static const double kGlassBlurAlpha    = 0.95;
-static const double kGlassFadeIn       = 0.12;
-static const double kGlassFadeOut      = 0.22;
-// ----------------------------------------------------
+// ========================================================
+// 1. INTERFACES & GLOBAL VARS
+// ========================================================
 
-// Forward decls for private classes / structs
-@interface BSAnimationSettings : NSObject
-@property (nonatomic, assign) double duration;
-@property (nonatomic, assign) double delay;
-@property (nonatomic, assign) double speed;
+@interface SBIconView : UIView
+- (CGRect)bounds;
+- (CGPoint)convertPoint:(CGPoint)point toView:(UIView *)view;
 @end
 
-@interface BSUIAnimationFactory : NSObject @end
-
-@interface SBFluidBehaviorSettings : NSObject
-@property (nonatomic, assign) double response;
-@property (nonatomic, assign) double dampingRatio;
-@property (nonatomic, assign) double mass;
+@interface SBDeviceApplicationSceneView : UIView
 @end
 
-// State flag so we know whether the *currently building* transition is an
-// "open" (home → app) or "close" (app → home). Set from SBMainWorkspace hook.
-static BOOL gIsOpening = YES;
+static CGRect gSourceIconFrame = (CGRect){{0, 0}, {0, 0}};
+static BOOL gHasSourceFrame = NO;
 
-// Glass overlay we briefly insert during transitions
-static UIVisualEffectView *gGlassOverlay = nil;
+// ========================================================
+// 2. PREFERENCES & CONFIGURATION
+// ========================================================
 
-static void presentGlassOverlay(void) {
-    UIWindow *kw = nil;
-    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in scene.windows) {
-                if (w.isKeyWindow) { kw = w; break; }
-            }
+static BOOL enabled = YES;
+static NSInteger speedMode = 1;
+
+static CGFloat lgBounceAmount = 42.0;
+static CGFloat lgPeakRadius = 120.0;
+static CGFloat lgEndRadius = 20.0;
+
+#define PREFS_DOMAIN @"com.tudepzai.appanimationprefs"
+#define NOTIFY_CHANGE "com.tudepzai.appanimationprefs/reload"
+
+static void loadPrefs() {
+    CFPreferencesAppSynchronize((__bridge CFStringRef)PREFS_DOMAIN);
+
+    Boolean validEnabled;
+    Boolean bEnabled = CFPreferencesGetAppBooleanValue(CFSTR("enabled"), (__bridge CFStringRef)PREFS_DOMAIN, &validEnabled);
+    enabled = validEnabled ? bEnabled : YES;
+
+    Boolean validSpeed;
+    CFIndex speedVal = CFPreferencesGetAppIntegerValue(CFSTR("speedMode"), (__bridge CFStringRef)PREFS_DOMAIN, &validSpeed);
+    speedMode = validSpeed ? speedVal : 1;
+
+    CFPropertyListRef bounceVal = CFPreferencesCopyAppValue(CFSTR("lgBounceAmount"), (__bridge CFStringRef)PREFS_DOMAIN);
+    if (bounceVal) {
+        if (CFGetTypeID(bounceVal) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)bounceVal, kCFNumberDoubleType, &lgBounceAmount);
         }
-        if (kw) break;
+        CFRelease(bounceVal);
     }
-    if (!kw) return;
 
-    if (gGlassOverlay) { [gGlassOverlay removeFromSuperview]; gGlassOverlay = nil; }
-
-    UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
-    gGlassOverlay = [[UIVisualEffectView alloc] initWithEffect:blur];
-    gGlassOverlay.frame = kw.bounds;
-    gGlassOverlay.alpha = 0.0;
-    gGlassOverlay.userInteractionEnabled = NO;
-    [kw addSubview:gGlassOverlay];
-
-    [UIView animateWithDuration:kGlassFadeIn animations:^{
-        gGlassOverlay.alpha = kGlassBlurAlpha;
-    } completion:^(BOOL fin){
-        [UIView animateWithDuration:kGlassFadeOut delay:0.05 options:UIViewAnimationOptionCurveEaseOut animations:^{
-            gGlassOverlay.alpha = 0.0;
-        } completion:^(BOOL f){
-            [gGlassOverlay removeFromSuperview];
-            gGlassOverlay = nil;
-        }];
-    }];
-}
-
-// ============ HOOKS ============
-
-// 1. Detect open vs close by watching the workspace transition request type.
-%hook SBMainWorkspaceTransitionRequest
-- (void)setEventLabel:(NSString *)label {
-    if ([label containsString:@"ActivateApplication"] || [label containsString:@"LaunchApplication"]) {
-        gIsOpening = YES;
-    } else if ([label containsString:@"DeactivateApplication"] || [label containsString:@"Home"]) {
-        gIsOpening = NO;
+    CFPropertyListRef peakVal = CFPreferencesCopyAppValue(CFSTR("lgPeakRadius"), (__bridge CFStringRef)PREFS_DOMAIN);
+    if (peakVal) {
+        if (CFGetTypeID(peakVal) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)peakVal, kCFNumberDoubleType, &lgPeakRadius);
+        }
+        CFRelease(peakVal);
     }
-    %orig;
-}
-%end
 
-// 2. Override spring physics. SpringBoard reads SBFluidBehaviorSettings
-//    when constructing the spring animators that drive the morph.
-%hook SBFluidBehaviorSettings
-- (double)response {
-    double v = %orig;
-    // Only override the "app transition" presets — leave dock / folder alone.
-    // Heuristic: SpringBoard's app-transition preset uses response ~0.5–0.6.
-    return gIsOpening ? kOpenResponse : kCloseResponse;
-    return v;
-}
-- (double)dampingRatio {
-    double v = %orig;
-    return gIsOpening ? kOpenDamping : kCloseDamping;
-    return v;
-}
-%end
-
-// 3. Shorten the explicit UIView durations used inside the icon-zoom animator.
-//    SBIconZoomAnimator drives the icon → app frame morph on iOS 16.
-%hook SBIconZoomAnimator
-- (void)_animateZoomWithDuration:(double)duration
-                      animations:(id)animations
-                      completion:(id)completion {
-    double newDur = gIsOpening ? kOpenDuration : kCloseDuration;
-    %orig(newDur, animations, completion);
+    CFPropertyListRef endVal = CFPreferencesCopyAppValue(CFSTR("lgEndRadius"), (__bridge CFStringRef)PREFS_DOMAIN);
+    if (endVal) {
+        if (CFGetTypeID(endVal) == CFNumberGetTypeID()) {
+            CFNumberGetValue((CFNumberRef)endVal, kCFNumberDoubleType, &lgEndRadius);
+        }
+        CFRelease(endVal);
+    }
 }
 
-- (double)_animationDuration {
-    return gIsOpening ? kOpenDuration : kCloseDuration;
+static NSTimeInterval getAnimationDuration() {
+    switch (speedMode) {
+        case 0:  return 1.10;
+        case 1:  return 0.70;
+        case 2:  return 0.40;
+        default: return 0.70;
+    }
 }
-%end
 
-// 4. Workspace transition duration (covers cases the zoom animator doesn't).
-%hook SBAppToAppWorkspaceTransition
-- (double)_animationDuration {
-    double orig = %orig;
-    if (orig > 0.1) return gIsOpening ? kOpenDuration : kCloseDuration;
-    return orig;
+// ========================================================
+// 3. LIQUID MORPH - PERSPECTIVE TRANSFORM THAT
+// ========================================================
+
+static CATransform3D LMPerspectiveTransformAtProgress(CGFloat t, CGRect iconFrame, CGRect screen,
+                                                       CGFloat bounceAmount) {
+    CGFloat screenW = screen.size.width;
+    CGFloat screenH = screen.size.height;
+
+    CGFloat iconCenterX = CGRectGetMidX(iconFrame);
+    CGFloat iconCenterY = CGRectGetMidY(iconFrame);
+    CGFloat screenCenterX = screenW / 2.0;
+    CGFloat screenCenterY = screenH / 2.0;
+
+    CGFloat normX = (iconCenterX - screenCenterX) / screenCenterX;
+    CGFloat normY = (iconCenterY - screenCenterY) / screenCenterY;
+    normX = MAX(-1.0, MIN(1.0, normX));
+    normY = MAX(-1.0, MIN(1.0, normY));
+
+    CGFloat startScaleX = MAX(0.05, iconFrame.size.width / screenW);
+    CGFloat startScaleY = MAX(0.05, iconFrame.size.height / screenH);
+
+    CGFloat eased = 1.0 - powf(1.0 - t, 3.0);
+
+    CGFloat maxTiltRad = 0.62;
+    CGFloat tiltFactor = powf(1.0 - t, 1.6);
+    CGFloat rotateX = -normY * maxTiltRad * tiltFactor;
+    CGFloat rotateY = normX * maxTiltRad * tiltFactor;
+
+    CGFloat bounceDirection = (iconCenterY > screenCenterY) ? -1.0 : 1.0;
+    CGFloat bounceNorm = bounceAmount / 100.0;
+    CGFloat bounceEnvelope = sinf(MIN(t, 1.0) * (CGFloat)M_PI) * bounceNorm * 40.0 * bounceDirection;
+
+    CGFloat scaleX = startScaleX + (1.0 - startScaleX) * eased;
+    CGFloat scaleY = startScaleY + (1.0 - startScaleY) * eased;
+
+    CGFloat offsetX = (iconCenterX - screenCenterX) * (1.0 - eased);
+    CGFloat offsetY = (iconCenterY - screenCenterY) * (1.0 - eased) + bounceEnvelope * (1.0 - eased);
+
+    CATransform3D transform = CATransform3DIdentity;
+    transform.m34 = -1.0 / 500.0;
+
+    transform = CATransform3DTranslate(transform, offsetX, offsetY, 0);
+    transform = CATransform3DRotate(transform, rotateX, 1.0, 0.0, 0.0);
+    transform = CATransform3DRotate(transform, rotateY, 0.0, 1.0, 0.0);
+    transform = CATransform3DScale(transform, scaleX, scaleY, 1.0);
+
+    return transform;
 }
-%end
 
-// 5. Trigger the glass overlay at the moment the transition begins.
-%hook SBMainWorkspace
-- (void)executeTransitionRequest:(id)request {
-    presentGlassOverlay();
-    %orig;
+static CGFloat LMHumpRadius(CGFloat t, CGFloat iconRadius, CGFloat peakRadius, CGFloat endRadius) {
+    if (t < 0.45) {
+        CGFloat local = t / 0.45;
+        return iconRadius + (peakRadius - iconRadius) * local;
+    } else {
+        CGFloat local = (t - 0.45) / 0.55;
+        if (local > 1) local = 1;
+        return peakRadius + (endRadius - peakRadius) * local;
+    }
 }
-%end
 
-// 6. Smooth the corner-radius morph during the open animation. iOS 26's
-//    "glass" look keeps a rounder corner radius almost all the way through.
+static void LMBuildKeyframes(CGRect iconFrame, CGRect screen, CGFloat bounceAmount,
+                              CGFloat peakRadius, CGFloat endRadius,
+                              NSArray **outTransforms, NSArray **outRadii) {
+    NSInteger steps = 30;
+    NSMutableArray *transforms = [NSMutableArray array];
+    NSMutableArray *radii = [NSMutableArray array];
+    CGFloat iconRadius = 13.0;
+
+    for (NSInteger i = 0; i <= steps; i++) {
+        CGFloat t = (CGFloat)i / (CGFloat)steps;
+        CATransform3D tr = LMPerspectiveTransformAtProgress(t, iconFrame, screen, bounceAmount);
+        [transforms addObject:[NSValue valueWithCATransform3D:tr]];
+        [radii addObject:@(LMHumpRadius(t, iconRadius, peakRadius, endRadius))];
+    }
+
+    *outTransforms = transforms;
+    *outRadii = radii;
+}
+
+// ========================================================
+// 4. HOOK ICON VIEW - CHI GHI LAI VI TRI
+// ========================================================
+
 %hook SBIconView
-- (void)_setHighlighted:(BOOL)highlighted forTouch:(id)touch { %orig; }
+
+- (void)setHighlighted:(BOOL)highlighted {
+    %orig;
+
+    if (!enabled || !highlighted) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = self.window;
+        if (window && CGRectGetWidth(self.bounds) > 0) {
+            gSourceIconFrame = [self convertRect:self.bounds toView:window];
+            gHasSourceFrame = YES;
+        }
+    });
+}
+
 %end
 
-%hook SBAppLaunchAnimator
-- (void)_configurePresentationAnimation {
+// ========================================================
+// 5. HOOK APP SCENE VIEW - LIQUID MORPH
+// ========================================================
+
+%hook SBDeviceApplicationSceneView
+
+- (void)didMoveToWindow {
     %orig;
-    // After SpringBoard sets up its layers, bump the icon-view's
-    // corner radius so the morph holds the rounded shape longer.
-UIView *iconView = [(NSObject *)self valueForKey:@"iconView"];
-    if (iconView) {
-        iconView.layer.cornerCurve = kCACornerCurveContinuous;
-    }
+
+    if (!enabled || self.window == nil) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSTimeInterval duration = getAnimationDuration();
+        CGRect screenBounds = [UIScreen mainScreen].bounds;
+
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [self.layer removeAllAnimations];
+        self.layer.mask = nil;
+        [CATransaction commit];
+
+        self.frame = screenBounds;
+        self.alpha = 1.0;
+        self.layer.masksToBounds = YES;
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+
+        CGRect iconFrame = gHasSourceFrame ? gSourceIconFrame :
+            CGRectMake(screenBounds.size.width / 2 - 30, screenBounds.size.height / 2 - 30, 60, 60);
+
+        NSArray *transforms;
+        NSArray *radii;
+        LMBuildKeyframes(iconFrame, screenBounds, lgBounceAmount, lgPeakRadius, lgEndRadius,
+                          &transforms, &radii);
+
+        CAKeyframeAnimation *transformAnim = [CAKeyframeAnimation animationWithKeyPath:@"transform"];
+        transformAnim.values = transforms;
+        transformAnim.duration = duration;
+        transformAnim.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        transformAnim.fillMode = kCAFillModeForwards;
+        transformAnim.removedOnCompletion = NO;
+        [self.layer addAnimation:transformAnim forKey:@"liquidmorph_transform"];
+        self.layer.transform = [transforms.lastObject CATransform3DValue];
+
+        CAKeyframeAnimation *radiusAnim = [CAKeyframeAnimation animationWithKeyPath:@"cornerRadius"];
+        radiusAnim.values = radii;
+        radiusAnim.duration = duration;
+        radiusAnim.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+        radiusAnim.fillMode = kCAFillModeForwards;
+        radiusAnim.removedOnCompletion = NO;
+        [self.layer addAnimation:radiusAnim forKey:@"liquidmorph_radius"];
+        self.layer.cornerRadius = [radii.lastObject floatValue];
+
+        CABasicAnimation *fadeAnim = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fadeAnim.fromValue = @0.0;
+        fadeAnim.toValue = @1.0;
+        fadeAnim.duration = duration * 0.18;
+        fadeAnim.removedOnCompletion = YES;
+        [self.layer addAnimation:fadeAnim forKey:@"liquidmorph_fade"];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((duration + 0.05) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            self.layer.masksToBounds = NO;
+            self.layer.cornerRadius = 0.0;
+            gHasSourceFrame = NO;
+        });
+    });
 }
+
 %end
+
+// ========================================================
+// 6. INITIALIZER
+// ========================================================
 
 %ctor {
-    NSLog(@"[iOS26Anim] loaded — open(%.2f/%.2f) close(%.2f/%.2f)",
-          kOpenResponse, kOpenDamping, kCloseResponse, kCloseDamping);
+    loadPrefs();
+
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        (CFNotificationCallback)loadPrefs,
+        CFSTR(NOTIFY_CHANGE),
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately
+    );
 }
